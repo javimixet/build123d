@@ -3165,8 +3165,12 @@ class Edge(Mixin1D[TopoDS_Edge]):
         curve_adaptor = BRepAdaptor_Curve(self.wrapped)
         if curve_adaptor.IsPeriodic():
             u_value = ((param - param_min) % curve_adaptor.Period()) / param_range
+            if not self.is_forward:
+                u_value = 1 - u_value
         else:
             u_value = (param - param_min) / param_range
+            if not self.is_forward:
+                u_value = 1 - u_value
         # Validate that GeomAPI_ProjectPointOnCurve worked correctly
         if (self.position_at(u_value) - pnt).length < TOLERANCE:
             return u_value
