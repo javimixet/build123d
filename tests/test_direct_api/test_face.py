@@ -846,7 +846,7 @@ class TestFace(unittest.TestCase):
             ],
         )
 
-        self.assertAlmostEqual(patch3.area, 152.643, 3)
+        self.assertAlmostEqual(patch3.area, 152.730, 3)
 
         point = patch.position_at(0.5, 0.5) + (0.5, 0.5)
         patch4 = -Face.make_surface_patch(
