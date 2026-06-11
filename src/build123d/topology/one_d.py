@@ -3041,20 +3041,27 @@ class Edge(Mixin1D[TopoDS_Edge]):
             the corresponding OCCT curve parameter and is_forward.
         """
         comp_curve = self.geom_adaptor()
-        length = GCPnts_AbscissaPoint.Length_s(comp_curve)
 
         if position_mode == PositionMode.PARAMETER:
+            # Linear interpolation of the parameter range [FirstParameter, LastParameter]
             if not self.is_forward:
                 position = 1 - position
-            value = position
-        else:
-            if not self.is_forward:
-                position = self.length - position
-            value = position / self.length
 
+            first = comp_curve.FirstParameter()
+            last = comp_curve.LastParameter()
+            occt_param = first + (last - first) * position
+            return comp_curve, occt_param, self.is_forward
+
+        # PositionMode.DISTANCE: Map distance to parameter using arc length
+        length = GCPnts_AbscissaPoint.Length_s(comp_curve)
+        if not self.is_forward:
+            position = self.length - position
+
+        # Use GCPnts_AbscissaPoint to find the parameter corresponding to the distance
         occt_param = GCPnts_AbscissaPoint(
-            comp_curve, length * value, comp_curve.FirstParameter()
+            comp_curve, position, comp_curve.FirstParameter()
         ).Parameter()
+
         return comp_curve, occt_param, self.is_forward
 
     def param_at(self, position: float) -> float:
@@ -3093,7 +3100,7 @@ class Edge(Mixin1D[TopoDS_Edge]):
 
         This method always returns a **normalized** parameter across the edge's full
         OCCT parameter range, even though the underlying OCP/OCCT queries work in
-        native (non-normalized) parameters. It is robust to several OCCT quirks:
+        native (non-normalized) parameters. It includes 2 methods:
 
         1) Vertex snap (fast path)
         If `point` coincides (within tolerance) with one of the edge's vertices,
@@ -3108,12 +3115,6 @@ class Edge(Mixin1D[TopoDS_Edge]):
         modulo by the parameter span and then normalized to [0, 1]. The projected
         answer is accepted only if re-evaluating the 3D point at that normalized
         parameter is within tolerance of the input `point`.
-
-        3) Fallback numeric search (robust path)
-        If the projector fails the validation, a bounded 1D search is performed
-        over [0, 1] using progressive subdivision and local minimization of the
-        3D distance ‖edge(u) - point‖. The first minimum found under geometric
-        resolution is returned.
 
         Args:
             point (VectorLike): A point expected to lie on this edge (within tolerance).
@@ -3152,9 +3153,6 @@ class Edge(Mixin1D[TopoDS_Edge]):
             raise ValueError(f"point ({pnt}) is {separation} from edge")
 
         # Method 2: project the point onto the edge
-        # There are known issues with the OCP methods for some
-        # curves which may return negative values or incorrect values at
-        # end points.
 
         # Extract the normalized parameter using OCCT GeomAPI_ProjectPointOnCurve
         curve = BRep_Tool.Curve_s(self.wrapped, float(), float())
@@ -3175,47 +3173,10 @@ class Edge(Mixin1D[TopoDS_Edge]):
         if (self.position_at(u_value) - pnt).length < TOLERANCE:
             return u_value
 
-        # Method 3: search the edge for the point
-        # Note that this search takes about 1.3ms on a complex curve while the
-        # OCP methods take about 0.4ms.
-
-        # This algorithm finds the normalized [0, 1] parameter of a point on an edge
-        # by minimizing the 3D distance between the edge and the given point.
-        #
-        # Because some edges (e.g., BSplines) can have multiple local minima in the
-        # distance function, we subdivide the [0, 1] domain into 2^n intervals
-        # (logarithmic refinement) and perform a bounded minimization in each subinterval.
-        #
-        # The first solution found with an error smaller than the geometric resolution
-        # is returned. If no such minimum is found after all subdivisions, a runtime error
-        # is raised.
-
-        max_divisions = 10  # Logarithmic refinement depth
-
-        for division in range(max_divisions):
-            intervals = 2**division
-            step = 1.0 / intervals
-
-            for i in range(intervals):
-                lo, hi = i * step, (i + 1) * step
-
-                result = minimize_scalar(
-                    lambda u: (self.position_at(u) - pnt).length,
-                    bounds=(lo, hi),
-                    method="bounded",
-                    options={"xatol": TOLERANCE / 2},
-                )
-
-                # Early exit if we're below resolution limit
-                if (
-                    result.fun
-                    < (
-                        self @ (result.x + TOLERANCE) - self @ (result.x - TOLERANCE)
-                    ).length
-                ):
-                    return round(float(result.x), TOL_DIGITS)
-
-        raise RuntimeError("Unable to find parameter, Edge is too complex")
+        raise RuntimeError(
+            "Unable to find parameter, edge.position_at(u_value) doesn't match "
+            "input point's position within TOLERANCE"
+        )
 
     def project_to_shape(
         self,
