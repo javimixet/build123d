@@ -3053,7 +3053,6 @@ class Edge(Mixin1D[TopoDS_Edge]):
             return comp_curve, occt_param, self.is_forward
 
         # PositionMode.DISTANCE: Map distance to parameter using arc length
-        length = GCPnts_AbscissaPoint.Length_s(comp_curve)
         if not self.is_forward:
             position = self.length - position
 
