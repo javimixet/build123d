@@ -266,7 +266,7 @@ class _WireFilletCorner:
 class _WireFilletSolution:
     """Replacement edges for a filleted wire corner."""
 
-    trimmed_topods_edges: list[TopoDS_Edge]
+    trimmed_topods_edges: list[TopoDS_Edge | None]
     fillet_topods_edge: TopoDS_Edge
 
 
@@ -297,34 +297,140 @@ def _analyze_wire_fillet_corner(wire: Wire, vertex: Vertex) -> _WireFilletCorner
     )
 
 
+def _extend_edge_for_fillet_fallback(
+    edge_wrapped: TopoDS_Edge, corner_vertex: TopoDS_Vertex
+) -> TopoDS_Edge | None:
+    """Extend an edge slightly beyond the corner vertex to give ChFi2d more room.
+
+    Returns the extended edge, or None if extension is not possible.
+    """
+    try:
+        adaptor = BRepAdaptor_Curve(edge_wrapped)
+        first = adaptor.FirstParameter()
+        last = adaptor.LastParameter()
+
+        parm_range = last - first
+        if abs(parm_range) < TOLERANCE:
+            return None
+
+        corner_param = BRep_Tool.Parameter_s(corner_vertex, edge_wrapped)
+
+        edge_len = adaptor.Value(last).Distance(adaptor.Value(first))
+        extension_dist = max(0.5, edge_len * 0.01)
+
+        # When the corner is near the start (first), extend past the end (last)
+        # so the trimmed remnant has enough length for ChFi2d to work with.
+        corner_near_start = abs(corner_param - first) < abs(corner_param - last)
+
+        t = last if corner_near_start else first
+        pnt = gp_Pnt()
+        vec = gp_Vec()
+        adaptor.D1(t, pnt, vec)
+        speed = vec.Magnitude()
+        if speed < TOLERANCE:
+            return None
+
+        param_delta = extension_dist / speed
+
+        if corner_near_start:
+            new_first, new_last = first, last + param_delta
+        else:
+            new_first, new_last = first - param_delta, last
+
+        # Get the underlying Geom_Curve
+        curve = BRep_Tool.Curve_s(edge_wrapped, first, last)
+
+        if isinstance(curve, Geom_BSplineCurve):
+            try:
+                curve.Segment(new_first, new_last)
+                new_edge = BRepBuilderAPI_MakeEdge(curve).Edge()
+            except Exception as e:
+                logger.debug("BSpline.Segment failed: %s", e)
+                return None
+        else:
+            new_edge = BRepBuilderAPI_MakeEdge(curve, new_first, new_last).Edge()
+
+        if new_edge.Orientation() != edge_wrapped.Orientation():
+            new_edge.Reverse()
+        return new_edge
+
+    except (RuntimeError, Standard_Failure, AttributeError) as e:
+        logger.debug("_extend_edge_for_fillet_fallback failed: %s", e)
+        return None
+
+
 def _solve_wire_fillet_corner_chfi2d(
     corner: _WireFilletCorner, radius: float
 ) -> _WireFilletSolution | None:
-    """Try to fillet a planar wire corner with ``ChFi2d_FilletAlgo``."""
-
-    fillet_builder = ChFi2d_FilletAlgo()
-    fillet_builder.Init(
-        corner.connected_edges[0].wrapped,
-        corner.connected_edges[1].wrapped,
-        Plane.XY.wrapped,
-    )
 
     vertex_point = BRep_Tool.Pnt_s(corner.vertex.wrapped)
-    if (
-        not fillet_builder.Perform(radius)
-        or fillet_builder.NbResults(vertex_point) == 0
-    ):
+    e0_orig = corner.connected_edges[0].wrapped
+    e1_orig = corner.connected_edges[1].wrapped
+
+    # --- Helpers ---
+
+    def run_fillet(e0: TopoDS_Edge, e1: TopoDS_Edge):
+        """Run ChFi2d. Returns (fillet_edge, t0, t1) or raises."""
+        builder = ChFi2d_FilletAlgo()
+        builder.Init(e0, e1, Plane.XY.wrapped)
+        if not builder.Perform(radius) or builder.NbResults(vertex_point) == 0:
+            raise RuntimeError("No fillet solution")
+        t0, t1 = TopoDS_Edge(), TopoDS_Edge()
+        fillet_edge = builder.Result(vertex_point, t0, t1)
+        return fillet_edge, t0, t1
+
+    def too_short(edge: TopoDS_Edge) -> bool:
+        return Edge(edge).length < 10 * TOLERANCE
+
+    def make_solution(fillet_edge, t0, t1, null_e0=False, null_e1=False):
+        return _WireFilletSolution(
+            trimmed_topods_edges=[None if null_e0 else t0, None if null_e1 else t1],
+            fillet_topods_edge=fillet_edge,
+        )
+
+    # --- Attempt 1: direct ---
+    extend_e0 = extend_e1 = False
+    try:
+        fillet_edge, t0, t1 = run_fillet(e0_orig, e1_orig)
+        extend_e0, extend_e1 = too_short(t0), too_short(t1)
+        if not extend_e0 and not extend_e1:
+            return make_solution(fillet_edge, t0, t1)
+    except Exception as e:
+        logger.debug("Chfi2d direct attempt failed: %s", e)
+        extend_e0 = extend_e1 = True
+
+    # --- Attempt 2: extend edges ---
+    e0_ext = (
+        _extend_edge_for_fillet_fallback(e0_orig, corner.vertex.wrapped)
+        if extend_e0
+        else e0_orig
+    )
+    e1_ext = (
+        _extend_edge_for_fillet_fallback(e1_orig, corner.vertex.wrapped)
+        if extend_e1
+        else e1_orig
+    )
+
+    if e0_ext is None or e1_ext is None:
         return None
+    try:
+        fillet_edge, t0, t1 = run_fillet(e0_ext, e1_ext)
+        # Determine which trimmed edges were fully consumed by the extension
+        null_e0 = Edge(t0).length <= (
+            Edge(e0_ext).length - Edge(e0_orig).length + 10 * TOLERANCE
+        )
+        null_e1 = Edge(t1).length <= (
+            Edge(e1_ext).length - Edge(e1_orig).length + 10 * TOLERANCE
+        )
+        if null_e0 and not null_e1:
+            fillet_edge, t0, t1 = run_fillet(e0_ext, e1_orig)
+        elif null_e1 and not null_e0:
+            fillet_edge, t0, t1 = run_fillet(e0_orig, e1_ext)
+        return make_solution(fillet_edge, t0, t1, null_e0=null_e0, null_e1=null_e1)
+    except (RuntimeError, Standard_Failure):
+        pass
 
-    trimmed_topods_edge0, trimmed_topods_edge1 = TopoDS_Edge(), TopoDS_Edge()
-    fillet_topods_edge = fillet_builder.Result(
-        vertex_point, trimmed_topods_edge0, trimmed_topods_edge1
-    )
-
-    return _WireFilletSolution(
-        trimmed_topods_edges=[trimmed_topods_edge0, trimmed_topods_edge1],
-        fillet_topods_edge=fillet_topods_edge,
-    )
+    return None
 
 
 def _topods_edge_contains_vertex(
@@ -413,13 +519,16 @@ def _solve_wire_fillet_corner_geom2dgcc_circ2d2tanrad(
             BRepBuilderAPI_MakeVertex(Vector(fillet_vertex).to_pnt()).Vertex()
         )
         split_edges = _split_edge_at_vertex(copy.deepcopy(connected_edge), split_vertex)
-        trimmed_topods_edges.append(
-            next(
+        edge_result = next(
+            (
                 edge
                 for edge in split_edges
                 if _topods_edge_contains_vertex(edge, other_vertex.wrapped)
-            )
+                and not _topods_edge_contains_vertex(edge, corner.vertex.wrapped)
+            ),
+            None,
         )
+        trimmed_topods_edges.append(edge_result)
 
     return _WireFilletSolution(
         trimmed_topods_edges=trimmed_topods_edges,
@@ -435,23 +544,37 @@ def _splice_wire_fillet_corner(
     all_topods_edges = [edge.wrapped for edge in corner.all_edges]
 
     # Flip any edges that were reversed during trimming
-    for i in range(2):
-        if (
-            solution.trimmed_topods_edges[i].Orientation()
-            != corner.connected_edges[i].wrapped.Orientation()
-        ):
-            solution.trimmed_topods_edges[i].Reverse()
+    indices_to_remove = set()
+    for i, trimmed in enumerate(solution.trimmed_topods_edges):
+        edge_idx = corner.connected_edge_indices[i]
+        if trimmed is None:
+            indices_to_remove.add(edge_idx)
+            continue
+        try:
+            edge_length = Edge(trimmed).length
+            if edge_length < 10 * TOLERANCE:
+                indices_to_remove.add(edge_idx)
+                continue
+        except (RuntimeError, Standard_Failure, AttributeError):
+            indices_to_remove.add(edge_idx)
+            continue
 
-    for i in range(2):
-        all_topods_edges[corner.connected_edge_indices[i]] = (
-            solution.trimmed_topods_edges[i]
-        )
+        if trimmed.Orientation() != corner.connected_edges[i].wrapped.Orientation():
+            trimmed.Reverse()
+        all_topods_edges[edge_idx] = trimmed
 
+    # Calculate insert index before removal (in original index space)
     n = len(all_topods_edges)
     if corner.connected_edge_indices[1] == (corner.connected_edge_indices[0] + 1) % n:
         insert_index = corner.connected_edge_indices[0] + 1
     else:
         insert_index = corner.connected_edge_indices[1] + 1
+
+    # Remove consumed edges in reverse order to preserve indices during deletion
+    for idx in sorted(indices_to_remove, reverse=True):
+        all_topods_edges.pop(idx)
+        if idx < insert_index:
+            insert_index -= 1
 
     all_topods_edges.insert(insert_index, solution.fillet_topods_edge)
 
@@ -461,7 +584,6 @@ def _splice_wire_fillet_corner(
     wire_builder = BRepBuilderAPI_MakeWire()
     wire_builder.Add(combined_edges)
     wire_builder.Build()
-
     return Wire(wire_builder.Wire())
 
 
@@ -471,15 +593,29 @@ def _fillet_wire_corner(wire: Wire, vertex: Vertex, radius: float) -> Wire:
     corner = _analyze_wire_fillet_corner(wire, vertex)
     if _wire_fillet_corner_is_tangent_continuous(corner):
         return wire
+
     vertex_label = str(vertex)
+    solution = _solve_wire_fillet_corner_geom2dgcc_circ2d2tanrad(corner, radius)
+
+    if solution is not None:
+        new_wire = _splice_wire_fillet_corner(corner, solution)
+        if not wire.is_closed or new_wire.is_closed:
+            return new_wire
+
     solution = _solve_wire_fillet_corner_chfi2d(corner, radius)
-    if solution is None:
-        solution = _solve_wire_fillet_corner_geom2dgcc_circ2d2tanrad(corner, radius)
+
     if solution is None:
         raise ValueError(
             f"Fillet algorithm failed for {vertex_label} with radius {radius}"
         )
-    return _splice_wire_fillet_corner(corner, solution)
+
+    new_wire = _splice_wire_fillet_corner(corner, solution)
+    if not wire.is_closed or new_wire.is_closed:
+        return new_wire
+
+    raise ValueError(
+        "Filleting failed to create a closed wire."
+    )
 
 
 class Mixin1D(Shape[TOPODS]):
