@@ -600,6 +600,7 @@ def _fillet_wire_corner(wire: Wire, vertex: Vertex, radius: float) -> Wire:
     if solution is not None:
         new_wire = _splice_wire_fillet_corner(corner, solution)
         if not wire.is_closed or new_wire.is_closed:
+            print("2tanrad succeed")
             return new_wire
 
     solution = _solve_wire_fillet_corner_chfi2d(corner, radius)
@@ -611,6 +612,7 @@ def _fillet_wire_corner(wire: Wire, vertex: Vertex, radius: float) -> Wire:
 
     new_wire = _splice_wire_fillet_corner(corner, solution)
     if not wire.is_closed or new_wire.is_closed:
+        print("chfi2d succeed")
         return new_wire
 
     raise ValueError(
